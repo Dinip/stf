@@ -2,6 +2,7 @@ const _ = require('lodash') // TODO: import debounce only
 const rotator = require('./rotator')
 const ImagePool = require('./imagepool')
 const Promise = require('bluebird')
+const HevcScreenRenderer = require('./hevc-screen')
 
 module.exports = function DeviceScreenDirective(
   $document,
@@ -60,7 +61,11 @@ module.exports = function DeviceScreenDirective(
           h: 0,
         },
       }
-      const scaler = ScalingService.coordinator(
+      // Reassignable: the HEVC path rebuilds this from the first decoded
+      // frame's real dimensions when the device record has none. The scaler
+      // only ever uses width/height as a ratio for letterboxing, so a missing
+      // or zero pair makes every touch coordinate NaN.
+      let scaler = ScalingService.coordinator(
         $scope.device.display.width,
         $scope.device.display.height
       )
@@ -78,6 +83,11 @@ module.exports = function DeviceScreenDirective(
       let wsReconnecting = false
       let tempUnavailableModalInstance = null
       let swipeMessage = false
+      // Non-null once the socket announces an HEVC stream (mcloud-ios-agent).
+      // Stays null for MJPEG devices, which keep the legacy path untouched.
+      let hevc = null
+      // Locked canvas footprint for the HEVC path — see hevcSurfaceFor().
+      let hevcSurface = null
 
       $scope.screen = screen
       ScreenLoaderService.show()
@@ -167,7 +177,12 @@ module.exports = function DeviceScreenDirective(
         function connectWS() {
           ws = new WebSocket($scope.device.display.url)
 
-          ws.binaryType = 'blob'
+          // 'arraybuffer' rather than 'blob' for both stream types. HEVC access
+          // units must be read synchronously inside the decode loop, and a
+          // Blob would force an async arrayBuffer() round-trip per frame. The
+          // MJPEG path is unaffected: it wraps the payload in a Blob itself,
+          // and that constructor takes an ArrayBuffer just as happily.
+          ws.binaryType = 'arraybuffer'
           ws.onerror = errorListener
           ws.onclose = closeListener
           ws.onopen = openListener
@@ -224,6 +239,47 @@ module.exports = function DeviceScreenDirective(
           screen.rotation = $scope.device.display.rotation
           let swipeTimeout;
 
+          // HEVC devices announce themselves with a codec handshake before any
+          // binary frame, so this branch is only ever entered on a stream from
+          // mcloud-ios-agent. Everything below it is untouched for MJPEG.
+          if (!hevc && HevcScreenRenderer.isCodecMessage(message.data)) {
+            hevc = new HevcScreenRenderer({
+              onFrame: drawHevcFrame,
+              onFirstFrame: onFirstHevcFrame,
+              onError: (err) => console.warn('[hevc] render failed', err),
+              // The agent forwards this to pymobiledevice3's /pli, which puts
+              // one RTCP PLI on the wire and gets an IDR back in ~100-300ms.
+              // Without it a decoder that lost reference state waits for the
+              // next natural keyframe, and the stream is long-GOP.
+              onRecoveryNeeded: requestHevcKeyframe,
+            })
+          }
+
+          if (hevc) {
+            if (message.data instanceof ArrayBuffer) {
+              // Decode only while the screen is actually being looked at, and
+              // clear any stale error the same way the MJPEG path does.
+              if (shouldUpdateScreen()) {
+                if ($scope.displayError) {
+                  $scope.$apply(() => {
+                    $scope.displayError = false
+                  })
+                }
+                hevc.handleMessage(message.data)
+              }
+              else {
+                // Not decoding right now, so the decoder is about to be
+                // missing references. Make it wait for a keyframe rather than
+                // resume mid-GOP onto frames it never saw.
+                hevc.markStale()
+              }
+              return
+            }
+            if (hevc.handleMessage(message.data)) {
+              return
+            }
+            // Not ours (e.g. 'secure_on') — fall through to the handling below.
+          }
 
           if (typeof message.data === 'string') {
               const data = JSON.parse(message.data);
@@ -248,7 +304,7 @@ module.exports = function DeviceScreenDirective(
             } 
           }        
 
-          if (message.data instanceof Blob) {
+          if (message.data instanceof ArrayBuffer) {
             if (shouldUpdateScreen()) {
               if ($scope.displayError) {
                 $scope.$apply(() => {
@@ -307,7 +363,124 @@ module.exports = function DeviceScreenDirective(
           }
         }
 
+        /**
+         * Ask the agent for an immediate keyframe.
+         *
+         * Rides the screen socket as a text control frame rather than a
+         * separate HTTP call: that socket is already open, already routed
+         * through nginx to this device, and already carries the 'on'/'off'
+         * control vocabulary.
+         */
+        function requestHevcKeyframe() {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send('pli')
+          }
+        }
+
+        /**
+         * The canvas footprint for the HEVC path, locked against per-frame
+         * jitter.
+         *
+         * Apple's encoder does not hold displayWidth/displayHeight constant:
+         * we see 1264x2752 alternating with 1264x2736 mid-stream as the home
+         * indicator toggles, and there are similar one-off changes when the
+         * device re-encodes under load. Feeding those straight into
+         * updateImageArea() resizes the canvas — which reallocates the backing
+         * store and reattaches a fresh GPU texture — several times a second
+         * while the user is swiping. That is the "stream glitches out when
+         * there's movement" symptom: not a decode failure, a canvas being
+         * rebuilt underneath the compositor.
+         *
+         * So the footprint is grow-only within an orientation. A 16px stretch
+         * (0.6%) is invisible; the resize was not. A genuine rotation flips
+         * the buffer aspect, which is the one case where a resize is correct.
+         */
+        function hevcSurfaceFor(width, height) {
+          const landscape = width > height
+
+          if (!hevcSurface || hevcSurface.landscape !== landscape) {
+            hevcSurface = {landscape: landscape, w: width, h: height}
+          } else {
+            hevcSurface.w = Math.max(hevcSurface.w, width)
+            hevcSurface.h = Math.max(hevcSurface.h, height)
+          }
+
+          return hevcSurface
+        }
+
+        /**
+         * Paint one decoded HEVC frame.
+         *
+         * Deliberately routed through updateImageArea() rather than sizing the
+         * canvas in the renderer: that function owns retina scaling, the
+         * rotation bookkeeping and the canvas size cap, and having two writers
+         * to the same canvas is how those get out of sync.
+         *
+         * `crop` is the content rectangle the renderer detected. Under motion
+         * iOS shrinks the captured screen into the top-left of the buffer and
+         * gray-pads the rest, so we stretch that region back over the full
+         * canvas; on a normal frame crop is simply the whole frame.
+         */
+        function drawHevcFrame(frame, crop) {
+          const surface = hevcSurfaceFor(frame.displayWidth, frame.displayHeight)
+
+          updateImageArea({width: surface.w, height: surface.h})
+
+          // Always stretch the source rect over the whole footprint. `crop` is
+          // the content region when iOS collapses capture resolution into the
+          // top-left corner under motion; on a normal frame it is the full
+          // frame. Either way the destination is the locked surface, so a
+          // collapse reads as a softness dip rather than the picture shrinking
+          // into a corner, and the 2752/2736 oscillation reads as nothing.
+          //
+          // Mirrors the MJPEG path's handling of the capped canvas: once
+          // updateImageArea() has clamped the backing store, draw to the
+          // clamped size instead.
+          if (canvas.width === 2484 && canvas.height === 5376) {
+            g.drawImage(frame, 0, 0, crop.width, crop.height, 0, 0, canvas.width, canvas.height)
+            return
+          }
+
+          g.drawImage(frame, 0, 0, crop.width, crop.height, 0, 0, surface.w, surface.h)
+        }
+
+        /**
+         * Called once, on the first successfully decoded frame.
+         *
+         * Besides hiding the loader, this adopts the device's real display
+         * dimensions from the frame itself. The agent reports them at
+         * registration via CoreDevice, but those key names are not contractual
+         * across iOS versions — and if they come back zero the scaler's
+         * width/height ratio is NaN and every touch coordinate collapses. The
+         * decoded frame is authoritative and always available, so prefer it.
+         */
+        function onFirstHevcFrame(frame) {
+          if (ScreenLoaderService.isVisible) {
+            ScreenLoaderService.hide()
+          }
+
+          const width = frame.displayWidth
+          const height = frame.displayHeight
+
+          if (!width || !height) {
+            return
+          }
+          if ($scope.device.display.width === width
+            && $scope.device.display.height === height) {
+            return
+          }
+
+          $scope.device.display.width = width
+          $scope.device.display.height = height
+          scaler = ScalingService.coordinator(width, height)
+          updateBounds()
+        }
+
         function stop() {
+          if (hevc) {
+            hevc.destroy()
+            hevc = null
+          }
           try {
             ws.onerror = ws.onclose = ws.onmessage = ws.onopen = null
             ws.close()
@@ -465,13 +638,28 @@ module.exports = function DeviceScreenDirective(
           cachedImageWidth = img.width
           cachedImageHeight = img.height
 
-          if (options.autoScaleForRetina) {
-            canvas.width = cachedImageWidth * frontBackRatio
-            canvas.height = cachedImageHeight * frontBackRatio
-            g.scale(frontBackRatio, frontBackRatio)
-          } else {
-            canvas.width = cachedImageWidth
-            canvas.height = cachedImageHeight
+          // Assigning canvas.width/height reallocates the backing store and
+          // drops the GPU texture, even when the value is identical. That is
+          // fine on a real size change and expensive otherwise, so only do it
+          // when the target actually differs — hasImageAreaChanged() also
+          // fires on a pure bounds/rotation change, where the pixel dimensions
+          // are unchanged and the reset just costs us a frame.
+          const targetWidth = options.autoScaleForRetina
+            ? Math.round(cachedImageWidth * frontBackRatio)
+            : cachedImageWidth
+          const targetHeight = options.autoScaleForRetina
+            ? Math.round(cachedImageHeight * frontBackRatio)
+            : cachedImageHeight
+
+          if (canvas.width !== targetWidth || canvas.height !== targetHeight) {
+            canvas.width = targetWidth
+            canvas.height = targetHeight
+
+            // The transform is part of the state that a resize clears, so it
+            // has to be re-applied here and only here.
+            if (options.autoScaleForRetina) {
+              g.scale(frontBackRatio, frontBackRatio)
+            }
           }
 
           if (canvasSizeExceeded() && $scope.device.version !== '18.0') {
@@ -816,8 +1004,27 @@ module.exports = function DeviceScreenDirective(
             $scope.device.ios,
           )
 
-          $scope.control.touchMove(nextSeq(), 0, scaled.xP, scaled.yP, pressure)
-          //$scope.control.touchMoveIos(nextSeq(), 0, scaled.xP, scaled.yP, pressure)
+          // iOS gets a real in-contact sample per pointer move. The Android
+          // TouchMoveMessage below has no handler on the iOS agent, so
+          // sending it there produced no device motion at all — the drag was
+          // only ever reconstructed at mouseup as a synthetic swipe, and by
+          // then the touchdown had already landed as a completed tap. Stream
+          // the samples instead: down -> move* -> up, which is what the
+          // device's HID digitizer expects and what a real drag looks like.
+          if ($scope.device.ios) {
+            $scope.control.touchMoveIos(
+              scaled.xP,
+              scaled.yP,
+              prevCoords.x,
+              prevCoords.y,
+              pressure,
+              0,
+              nextSeq()
+            )
+            prevCoords = {x: scaled.xP, y: scaled.yP}
+          } else {
+            $scope.control.touchMove(nextSeq(), 0, scaled.xP, scaled.yP, pressure)
+          }
 
           if (addGhostFinger) {
             // TODO: can be non boolean?
@@ -873,18 +1080,30 @@ module.exports = function DeviceScreenDirective(
             $scope.device.ios,
           )
 
-          if ((Math.abs(prevCoords.x - scaled.xP) >= 0.1
-            || Math.abs(prevCoords.y - scaled.yP) >= 0.1)
-            && $scope.device.ios && $scope.device.ios === true) { // TODO: can be non boolean?
-            $scope.control.touchMoveIos(
-              scaled.xP,
-              scaled.yP,
-              prevCoords.x,
-              prevCoords.y,
-              pressure,
-              nextSeq(),
-              0
-            )
+          // iOS: emit the final in-contact sample at the release point before
+          // lifting, so a gesture that ends between two mousemove events still
+          // terminates where the user let go.
+          //
+          // This used to be the ONLY place a drag was reported — a single
+          // from/to swipe synthesised at mouseup, gated on having moved >= 0.1
+          // of the screen. Two things broke because of that: anything shorter
+          // than 10% of the display never moved the device at all, and even
+          // when it did fire, the touchdown had already been dispatched as a
+          // complete tap, so the click landed first. Both are gone now that
+          // mousemove streams samples.
+          if ($scope.device.ios) {
+            if (prevCoords.x !== scaled.xP || prevCoords.y !== scaled.yP) {
+              $scope.control.touchMoveIos(
+                scaled.xP,
+                scaled.yP,
+                prevCoords.x,
+                prevCoords.y,
+                pressure,
+                0,
+                nextSeq()
+              )
+            }
+            prevCoords = {x: scaled.xP, y: scaled.yP}
           }
 
           $scope.control.touchUp(nextSeq(), 0)
@@ -1039,6 +1258,8 @@ module.exports = function DeviceScreenDirective(
 
             slotted[touch.identifier] = slot
             if ($scope.device.ios && $scope.device.ios === true) { // TODO: can be non boolean?
+              // Anchor the streaming origin, same as the mouse path does.
+              prevCoords = {x: scaled.xP, y: scaled.yP}
               $scope.control.touchDownIos(nextSeq(), slot, scaled.xP, scaled.yP, pressure)
             } else {
               $scope.control.touchDown(nextSeq(), slot, scaled.xP, scaled.yP, pressure)
@@ -1080,11 +1301,24 @@ module.exports = function DeviceScreenDirective(
             )
 
             if ($scope.device.ios) {
-              const touchev = e.touches[0];
+              // Was passing raw page pixels as the destination and the
+              // normalised point as the origin — with the argument order
+              // swapped on top of that — so a touchscreen drag sent the device
+              // coordinates like (612, 388) where it expects 0..1. Send this
+              // touch's own scaled position, same streaming shape as the mouse
+              // path.
+              $scope.control.touchMoveIos(
+                scaled.xP,
+                scaled.yP,
+                prevCoords.x,
+                prevCoords.y,
+                pressure,
+                slot,
+                nextSeq()
+              )
+              prevCoords = {x: scaled.xP, y: scaled.yP}
 
-              $scope.control.touchMoveIos(touchev.pageX, touchev.pageY, scaled.xP, scaled.yP, 0.5);
-            
-              activateFinger(slot, x, y, pressure);
+              activateFinger(slot, x, y, pressure)
             }
           }
 
