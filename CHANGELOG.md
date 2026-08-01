@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.7.0 (2026-08-01)
+
+* feat: implement hvec for ios and cursor improvements
+* build: multistage docker builds
+* ci: implement release workflow
+
 ## 3.6.6 (2023-08-18)
 
 * fix bug on taking control of a device: set a lock for exclusive access by @denis99999 in https://github.com/DeviceFarmer/stf/pull/650
