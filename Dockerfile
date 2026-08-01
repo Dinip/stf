@@ -2,101 +2,140 @@
 # Copyright © 2022 contains code contributed by Orange SA, authors: Denis Barbaron - Licensed under the Apache license 2.0
 #
 
-FROM ubuntu:20.04
+# ---------------------------------------------------------------------------
+# Stage 1: fetch external binaries (go-ios, bundletool)
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS fetch
 
-# Sneak the stf executable into $PATH.
-ENV PATH=/opt/bin:$PATH
-
-# Work in app dir by default.
-WORKDIR /opt
-
-# Export default app port
-EXPOSE 3000
-
-ENV DEVICE_UDID=
+ARG GO_IOS_VERSION=1.2.0
+ARG BUNDLETOOL_VERSION=1.2.0
 
 ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update && \
-        apt-get install -y curl wget unzip iputils-ping nano telnet libimobiledevice-utils libimobiledevice6 cmake git build-essential jq libplist-utils socat
+    apt-get install -y --no-install-recommends ca-certificates wget unzip && \
+    rm -rf /var/lib/apt/lists/*
 
-# jq - jquery command line to operate with go-ios utility
-# libplist-utils - plistutil to convert binary Info.plist into the xml
+# go-ios utility to manage iOS devices connected to a Linux provider host
+RUN mkdir -p /out/bin && \
+    wget --progress=dot:mega -O /tmp/go-ios-linux.zip \
+      "https://github.com/danielpaulus/go-ios/releases/download/v${GO_IOS_VERSION}/go-ios-linux.zip" && \
+    unzip /tmp/go-ios-linux.zip -d /out/bin && \
+    chmod +x /out/bin/* && \
+    rm /tmp/go-ios-linux.zip
 
-# go-ios utility to manage iOS devices connected to Linux provider host
-#Grab gidevice from github and extract it in a folder
-RUN wget https://github.com/danielpaulus/go-ios/releases/download/v1.0.120/go-ios-linux.zip && unzip go-ios-linux.zip -d /usr/local/bin && rm go-ios-linux.zip
+RUN mkdir -p /out/bundletool && \
+    wget --progress=dot:mega -O /out/bundletool/bundletool.jar \
+      "https://github.com/google/bundletool/releases/download/${BUNDLETOOL_VERSION}/bundletool-all-${BUNDLETOOL_VERSION}.jar"
 
-# Install app requirements. Trying to optimize push speed for dependant apps
-# by reducing layers as much as possible. Note that one of the final steps
-# installs development files for node-gyp so that npm install won't have to
-# wait for them on the first native module installation.
-RUN useradd --system \
-      --create-home \
-      --shell /usr/sbin/nologin \
-      stf-build && \
-    useradd --system \
-      --create-home \
-      --shell /usr/sbin/nologin \
-      stf && \
-    sed -i'' 's@http://archive.ubuntu.com/ubuntu/@mirror://mirrors.ubuntu.com/mirrors.txt@' /etc/apt/sources.list && \
-    apt-get update && \
-    apt-get -y install wget python3 build-essential && \
-    cd /tmp && \
+# ---------------------------------------------------------------------------
+# Stage 2: build the app
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS builder
+
+ARG NODE_VERSION=17.9.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    SETUPTOOLS_USE_DISTUTILS=local
+
+# Toolchain + native module headers.
+# Ubuntu 24.04 ships Python 3.12, which dropped distutils; node-gyp's bundled
+# gyp still imports it, so setuptools provides the shim.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates wget git python3 python3-setuptools build-essential cmake yasm \
+      libzmq3-dev libprotobuf-dev graphicsmagick && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --create-home --shell /usr/sbin/nologin stf-build
+
+# Node.js runtime (shared with the final stage via /usr/local).
+RUN cd /tmp && \
     wget --progress=dot:mega \
-      https://nodejs.org/dist/v17.9.0/node-v17.9.0-linux-x64.tar.xz && \
+      "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" && \
     tar -xJf node-v*.tar.xz --strip-components 1 -C /usr/local && \
     rm node-v*.tar.xz && \
-    su stf-build -s /bin/bash -c '/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js install' && \
-    apt-get -y install libzmq3-dev libprotobuf-dev git graphicsmagick openjdk-8-jdk yasm cmake && \
-    apt-get clean && \
-    rm -rf /var/cache/apt/* /var/lib/apt/lists/* && \
-    mkdir /tmp/bundletool && \
-    cd /tmp/bundletool && \
-    wget --progress=dot:mega \
-      https://github.com/google/bundletool/releases/download/1.2.0/bundletool-all-1.2.0.jar && \
-    mv bundletool-all-1.2.0.jar bundletool.jar
+    su stf-build -s /bin/bash -c '/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js install'
 
 # Copy app source.
-COPY . /tmp/build/
+COPY --chown=stf-build:stf-build . /tmp/build/
 
-# Give permissions to our build user.
-RUN mkdir -p /opt && \
-    mkdir -p /data && \
-    chown -R stf-build:stf-build /tmp/build /tmp/bundletool /opt && \
-    chown -R stf:stf /data
+RUN mkdir -p /opt && chown -R stf-build:stf-build /opt
 
-RUN mkdir data &&\
-    chown stf-build: data
-
-RUN ln -s /opt /app
-# Switch over to the build user.
 USER stf-build
 
 # Run the build.
 RUN set -x && \
     cd /tmp/build && \
     export PATH=$PWD/node_modules/.bin:$PATH && \
-    npm install --python="/usr/bin/python3"  --loglevel http && \
+    npm install --python="/usr/bin/python3" --loglevel http && \
     npm pack && \
     tar xzf devicefarmer-stf-*.tgz --strip-components 1 -C /opt && \
     bower cache clean && \
     npm prune --production && \
     mv node_modules /opt && \
-    rm -rf ~/.node-gyp && \
-    mkdir /opt/bundletool && \
-    mv /tmp/bundletool/* /opt/bundletool && \
-    cd /opt && \
-    find /tmp -mindepth 1 ! -regex '^/tmp/hsperfdata_root\(/.*\)?' -delete
+    rm -rf ~/.node-gyp ~/.npm ~/.cache
 
-RUN cp ./icon/x120/iOS.jpg /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x120/iOS && \
-    cp ./icon/x24/iOS.jpg /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/iOS && \
+# Device icon overrides.
+RUN set -x && \
+    cd /tmp/build && \
+    cp ./icon/x120/iOS.jpg     /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x120/iOS && \
+    cp ./icon/x24/iOS.jpg      /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/iOS && \
     cp ./icon/x120/Android.jpg /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x120/Android && \
-    cp ./icon/x24/Android.jpg /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/Android && \
-    cp ./icon/x24/tvOS.png /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/tvOS && \
-    cp ./icon/x120/tvOS.png /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x120/tvOS
+    cp ./icon/x24/Android.jpg  /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/Android && \
+    cp ./icon/x24/tvOS.png     /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x24/tvOS && \
+    cp ./icon/x120/tvOS.png    /opt/node_modules/@devicefarmer/stf-device-db/dist/icon/x120/tvOS
 
-#951 bump up Pixel 7 on Andoroid 14
-COPY files/STFService.apk /opt/vendor/STFService
+# #951 bump up Pixel 7 on Android 14
+COPY --chown=stf-build:stf-build files/STFService.apk /opt/vendor/STFService/STFService.apk
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.title="STF" \
+      org.opencontainers.image.description="Smartphone Test Farm" \
+      org.opencontainers.image.source="https://github.com/Dinip/stf"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    DEVICE_UDID= \
+    PATH=/opt/bin:$PATH
+
+# Runtime dependencies only - no compilers, headers or SDKs.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      graphicsmagick \
+      iputils-ping \
+      jq \
+      libimobiledevice-utils \
+      libimobiledevice6 \
+      libplist-utils \
+      libprotobuf32t64 \
+      libzmq5 \
+      openjdk-8-jre-headless \
+      socat \
+      unzip && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/*
+
+RUN useradd --system --create-home --shell /usr/sbin/nologin stf && \
+    mkdir -p /opt/data /data && \
+    chown -R stf:stf /opt /data && \
+    ln -s /opt /app
+
+# Node.js runtime, built app and external tools.
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder --chown=stf:stf /opt /opt
+COPY --from=fetch /out/bin/ /usr/local/bin/
+COPY --from=fetch --chown=stf:stf /out/bundletool/ /opt/bundletool/
+
+WORKDIR /opt
+
+# Export default app port
+EXPOSE 3000
 
 # Switch to the app user.
 USER stf
