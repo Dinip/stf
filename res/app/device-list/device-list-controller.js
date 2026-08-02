@@ -3,6 +3,7 @@
 **/
 
 var QueryParser = require('./util/query-parser')
+var storage = require('./../util/local-storage')
 
 module.exports = function DeviceListCtrl(
   $scope
@@ -223,10 +224,10 @@ module.exports = function DeviceListCtrl(
 
   $scope.applyFilter = function(query) {
     if (!query) {
-      localStorage.removeItem('deviceFilters')
-      localStorage.setItem('deviceFilters', JSON.stringify([]))
+      storage.setJSON('deviceFilters', [])
       $scope.filter = []
       $route.reload()
+      return
     }
     $scope.filter = QueryParser.parse(query)
   }
@@ -247,11 +248,10 @@ module.exports = function DeviceListCtrl(
     $scope.filter = []
     $scope.sort = defaultSort
     $scope.columns = defaultColumns
-    localStorage.removeItem('deviceFilters')
-    localStorage.setItem('deviceFilters', JSON.stringify([]))
+    storage.setJSON('deviceFilters', [])
   }
 
-  let deviceFilters = JSON.parse(localStorage.getItem('deviceFilters')) || []
+  let deviceFilters = storage.getArray('deviceFilters')
 
   let filter = deviceFilters[0]
 

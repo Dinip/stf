@@ -1,4 +1,5 @@
 var patchArray = require('./../util/patch-array')
+var storage = require('./../../util/local-storage')
 
 module.exports = function DeviceListIconsDirective(
   $filter
@@ -285,7 +286,8 @@ module.exports = function DeviceListIconsDirective(
 
       // Updates filters on visible items.
       function updateFilters(filters) {
-        let deviceFilters = JSON.parse(localStorage.getItem('deviceFilters'))
+        let deviceFilters = storage.getArray('deviceFilters')
+        filters = filters || []
 
         // Use input filters
         if (!deviceFilters[0]) {
@@ -322,8 +324,7 @@ module.exports = function DeviceListIconsDirective(
 
       // Saves and updates filters on LocalStorage.
       function storeFilters(filters) {
-        localStorage.removeItem('deviceFilters')
-        localStorage.setItem('deviceFilters', JSON.stringify(filters))
+        storage.setJSON('deviceFilters', filters || [])
       }
 
       // Applies filteItem() to all items.

@@ -1,4 +1,5 @@
 var patchArray = require('./../util/patch-array')
+var storage = require('./../../util/local-storage')
 
 module.exports = function DeviceListDetailsDirective(
   $filter
@@ -256,10 +257,11 @@ module.exports = function DeviceListDetailsDirective(
 
       // Updates filters on visible items.
       function updateFilters(filters) {
-        let deviceFilters = JSON.parse(localStorage.getItem('deviceFilters'))
+        let deviceFilters = storage.getArray('deviceFilters')
+        filters = filters || []
 
         // Use input filters
-        if (!deviceFilters || !deviceFilters[0]) {
+        if (!deviceFilters[0]) {
           activeFilters = filters
           storeFilters(filters)
           return filterAll()
@@ -294,8 +296,7 @@ module.exports = function DeviceListDetailsDirective(
 
       // Saves and updates filters on LocalStorage.
       function storeFilters(filters) {
-        localStorage.removeItem('deviceFilters')
-        localStorage.setItem('deviceFilters', JSON.stringify(filters))
+        storage.setJSON('deviceFilters', filters || [])
       }
 
       // Applies filterRow() to all rows.
@@ -484,8 +485,6 @@ module.exports = function DeviceListDetailsDirective(
       }
 
       function storeRows() {
-        localStorage.removeItem('deviceOrder')
-
         var tableRows = tbody.querySelectorAll('tr')
         var rowsArray = []
         
@@ -493,7 +492,7 @@ module.exports = function DeviceListDetailsDirective(
           rowsArray.push(rowElement.outerHTML)
         })
   
-        localStorage.setItem('deviceOrder', JSON.stringify(rowsArray))
+        storage.setJSON('deviceOrder', rowsArray)
       }
 
       // Patches all rows.
@@ -504,7 +503,7 @@ module.exports = function DeviceListDetailsDirective(
       }
 
       function storeDevices(device) {
-        let deviceData = JSON.parse(localStorage.getItem('deviceData'))
+        let deviceData = storage.getArray('deviceData')
 
         const index = deviceData.findIndex((storedDevice) => storedDevice.serial === device.serial)
 
@@ -512,7 +511,7 @@ module.exports = function DeviceListDetailsDirective(
           deviceData[index] = device
         }
 
-        localStorage.setItem('deviceData', JSON.stringify(deviceData))
+        storage.setJSON('deviceData', deviceData)
       }
 
       // Patches the given row by running the given patch operations in
@@ -691,7 +690,7 @@ module.exports = function DeviceListDetailsDirective(
 
       // Triggers when the tracker sees a device for the first time.
       function addListener(device) {
-        let deviceData = localStorage.getItem('deviceData') ? JSON.parse(localStorage.getItem('deviceData')) : [];
+        let deviceData = storage.getArray('deviceData')
 
         let existingDevice = deviceData.some(lsDevice => lsDevice.serial === device.serial)
 
@@ -717,13 +716,17 @@ module.exports = function DeviceListDetailsDirective(
           }
         }
 
-        if (localStorage.getItem('deviceOrder') && !tbody.innerHTML) {
+        let rowOrder = storage.getArray('deviceOrder')
 
-          let rowOrder = JSON.parse(localStorage.getItem('deviceOrder'))
+        if (rowOrder.length && !tbody.innerHTML) {
 
           rowOrder.forEach(storedRow => {
             let idMatch = storedRow.match(/id="[^-]+-([^"]+)"/)
-            
+
+            if (!idMatch) {
+              return
+            }
+
             let matchingDevices = deviceData.some(element => {
               return element.serial === idMatch[1]
             })
@@ -743,7 +746,7 @@ module.exports = function DeviceListDetailsDirective(
           deviceData.push(device)
       
           // Store the updated array in LocalStorage
-          localStorage.setItem('deviceData', JSON.stringify(deviceData))
+          storage.setJSON('deviceData', deviceData)
 
           let row = createRow(device)
 
