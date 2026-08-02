@@ -17,7 +17,12 @@ module.exports = function($location) {
 
       for (var i = 0; i < links.length; i++) {
         link = angular.element(links[i])
-        url = link.attr('ng-href')
+        url = link.attr('ng-href') || link.attr('href')
+
+        // Skip links without a URL (e.g. ng-click-only anchors)
+        if (!url) {
+          continue
+        }
 
         // Remove angular route expressions
         url = url.replace(/\/{{.*}}/g, '')
