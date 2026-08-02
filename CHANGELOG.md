@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.7.1 (2026-08-02)
+
+* fix: finding invalid ng-href nav menu
+* fix: missing null checks for localStorage retrieval
+
 ## 3.7.0 (2026-08-01)
 
 * feat: implement hvec for ios and cursor improvements
